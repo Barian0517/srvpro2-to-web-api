@@ -5,6 +5,7 @@ const Database = require('better-sqlite3');
 const fs = require('fs');
 const path = require('path');
 const yaml = require('js-yaml');
+const { ZipArchive } = require('archiver');
 
 dotenv.config();
 
@@ -30,10 +31,10 @@ if (CONFIG_YAML_PATH) {
     if (config.ygoproPath && Array.isArray(config.ygoproPath)) {
         validCardDirs = config.ygoproPath
             .filter(p => p !== './ygopro')
-            .map(p => path.join(baseDir, p));
+            .map(p => path.resolve(baseDir, p)); // 強制轉換為絕對路徑，解決 Linux TypeError
     }
 } else if (DIY_CARD_DIR) {
-    validCardDirs = [DIY_CARD_DIR];
+    validCardDirs = [path.resolve(DIY_CARD_DIR)];
 }
 
 if (validCardDirs.length === 0) {
@@ -44,8 +45,51 @@ if (validCardDirs.length === 0) {
 let cards = [];
 let cardMap = new Map();
 let dbFilesFound = 0;
+const BUNDLE_ZIP_PATH = path.join(__dirname, 'bundle.zip');
 
-function loadDatabases() {
+function generateYpkBundle() {
+    return new Promise((resolve, reject) => {
+        const output = fs.createWriteStream(BUNDLE_ZIP_PATH);
+        const archive = new ZipArchive({
+            zlib: { level: 9 }
+        });
+
+        output.on('close', () => {
+            console.log(`Bundle generated successfully: ${archive.pointer()} total bytes`);
+            resolve();
+        });
+
+        archive.on('error', (err) => {
+            console.error('Error generating bundle:', err);
+            reject(err);
+        });
+
+        archive.pipe(output);
+
+        let ypkCount = 0;
+        for (const dir of validCardDirs) {
+            if (!fs.existsSync(dir)) continue;
+            const files = fs.readdirSync(dir);
+            const ypkFiles = files.filter(f => f.toLowerCase().endsWith('.ypk'));
+            
+            for (const ypkFile of ypkFiles) {
+                const ypkPath = path.join(dir, ypkFile);
+                const folderName = path.basename(dir);
+                // 使用 資料夾名稱_檔案名稱 避免不同資料夾的 ypk 同名衝突
+                archive.file(ypkPath, { name: `${folderName}_${ypkFile}` });
+                ypkCount++;
+            }
+        }
+        
+        if (ypkCount === 0) {
+            console.log("No YPK files found to bundle.");
+        }
+
+        archive.finalize();
+    });
+}
+
+async function loadDatabases() {
     cards = [];
     cardMap.clear();
     dbFilesFound = 0;
@@ -88,14 +132,15 @@ function loadDatabases() {
         }
     }
     console.log(`Total cards loaded: ${cards.length}`);
+    await generateYpkBundle();
 }
 
 // Initial load
 loadDatabases();
 
 // 重新載入資料庫的 API
-app.post('/api/refresh', (req, res) => {
-    loadDatabases();
+app.post('/api/refresh', async (req, res) => {
+    await loadDatabases();
     res.json({ success: true, totalCards: cards.length, dbFilesFound });
 });
 
@@ -164,9 +209,9 @@ app.get('/api/images/:id', (req, res) => {
         const imagePng = path.join(dir, 'pics', `${id}.png`);
 
         if (fs.existsSync(imageJpg)) {
-            return res.sendFile(imageJpg);
+            return res.sendFile(path.resolve(imageJpg));
         } else if (fs.existsSync(imagePng)) {
-            return res.sendFile(imagePng);
+            return res.sendFile(path.resolve(imagePng));
         }
     }
     res.status(404).json({ error: "Image not found" });
@@ -180,7 +225,7 @@ app.get('/api/scripts/:id', (req, res) => {
 
         if (fs.existsSync(scriptPath)) {
             res.type('text/plain');
-            return res.sendFile(scriptPath);
+            return res.sendFile(path.resolve(scriptPath));
         }
     }
     res.status(404).json({ error: "Script not found" });
@@ -188,17 +233,11 @@ app.get('/api/scripts/:id', (req, res) => {
 
 app.get('/api/download/ypk', (req, res) => {
     try {
-        for (const dir of validCardDirs) {
-            if (!fs.existsSync(dir)) continue;
-            const files = fs.readdirSync(dir);
-            const ypkFile = files.find(f => f.toLowerCase().endsWith('.ypk'));
-            
-            if (ypkFile) {
-                const ypkPath = path.join(dir, ypkFile);
-                return res.download(ypkPath);
-            }
+        if (fs.existsSync(BUNDLE_ZIP_PATH)) {
+            res.download(BUNDLE_ZIP_PATH, 'bundle.zip');
+        } else {
+            res.status(404).json({ error: "YPK bundle not found or not generated yet" });
         }
-        res.status(404).json({ error: "YPK file not found in the directories" });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: "Internal server error" });
