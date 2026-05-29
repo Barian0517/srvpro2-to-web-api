@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const yaml = require('js-yaml');
 const { ZipArchive } = require('archiver');
+const crypto = require('crypto');
 
 dotenv.config();
 
@@ -46,6 +47,28 @@ let cards = [];
 let cardMap = new Map();
 let dbFilesFound = 0;
 const BUNDLE_ZIP_PATH = path.join(__dirname, 'bundle.zip');
+let bundleHash = null;
+let isReloading = false;
+let reloadTimeout = null;
+
+function updateBundleHash() {
+    try {
+        if (fs.existsSync(BUNDLE_ZIP_PATH)) {
+            const hashSum = crypto.createHash('sha256');
+            const stream = fs.createReadStream(BUNDLE_ZIP_PATH);
+            stream.on('data', data => hashSum.update(data));
+            stream.on('end', () => {
+                bundleHash = hashSum.digest('hex');
+                console.log(`Bundle hash updated: ${bundleHash}`);
+            });
+            stream.on('error', err => {
+                console.error("Error reading bundle for hash:", err);
+            });
+        }
+    } catch (err) {
+        console.error("Error updating bundle hash:", err);
+    }
+}
 
 function generateYpkBundle() {
     return new Promise((resolve, reject) => {
@@ -56,6 +79,7 @@ function generateYpkBundle() {
 
         output.on('close', () => {
             console.log(`Bundle generated successfully: ${archive.pointer()} total bytes`);
+            updateBundleHash();
             resolve();
         });
 
@@ -90,6 +114,7 @@ function generateYpkBundle() {
 }
 
 async function loadDatabases() {
+    isReloading = true;
     cards = [];
     cardMap.clear();
     dbFilesFound = 0;
@@ -132,11 +157,40 @@ async function loadDatabases() {
         }
     }
     console.log(`Total cards loaded: ${cards.length}`);
-    await generateYpkBundle();
+    try {
+        await generateYpkBundle();
+    } catch (err) {
+        console.error("Error generating YPK bundle:", err);
+    }
+    isReloading = false;
 }
 
+function triggerReload() {
+    if (isReloading) return;
+    if (reloadTimeout) clearTimeout(reloadTimeout);
+    reloadTimeout = setTimeout(() => {
+        console.log("Detected changes in card directories, reloading...");
+        loadDatabases().catch(err => console.error("Reload error:", err));
+    }, 5000); // 5 seconds debounce
+}
+
+// Setup directory watching for automatic reload
+validCardDirs.forEach(dir => {
+    if (fs.existsSync(dir)) {
+        try {
+            fs.watch(dir, { recursive: true }, (eventType, filename) => {
+                // Ignore the bundle.zip itself to prevent infinite reload loop
+                if (filename && filename.includes('bundle.zip')) return;
+                triggerReload();
+            });
+        } catch (err) {
+            console.error(`Failed to watch directory ${dir}:`, err);
+        }
+    }
+});
+
 // Initial load
-loadDatabases();
+loadDatabases().catch(err => console.error("Initial load error:", err));
 
 // 重新載入資料庫的 API
 app.post('/api/refresh', async (req, res) => {
@@ -148,7 +202,8 @@ app.get('/api/info', (req, res) => {
     res.json({
         validCardDirs,
         totalCards: cards.length,
-        dbFilesFound
+        dbFilesFound,
+        bundleHash
     });
 });
 
@@ -229,6 +284,14 @@ app.get('/api/scripts/:id', (req, res) => {
         }
     }
     res.status(404).json({ error: "Script not found" });
+});
+
+app.get('/api/hash', (req, res) => {
+    if (bundleHash) {
+        res.json({ hash: bundleHash });
+    } else {
+        res.status(404).json({ error: "Hash not available yet" });
+    }
 });
 
 app.get('/api/download/ypk', (req, res) => {
