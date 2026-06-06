@@ -8,6 +8,7 @@ const yaml = require('js-yaml');
 const { ZipArchive } = require('archiver');
 const crypto = require('crypto');
 const { Pool } = require('pg');
+const lzma = require('lzma');
 
 dotenv.config();
 
@@ -690,20 +691,32 @@ app.get('/api/stats/replays/:id/download', async (req, res) => {
         }
 
         const messagesBase64 = result.rows[0].messages;
+        const seed = result.rows[0].seed || 0;
         const msgBuf = Buffer.from(messagesBase64, 'base64');
         
-        // 建立 YRP 檔案
-        // YRP 標頭: 'yrp1' = 0x31707279, Version = 0 (目前版本有可能是其他數字，不影響太多), Hash = 0, Props = 0?
-        // 實際上 YRP 的前 16 bytes 通常包含一些標記，然後是 LZMA 壓縮的 payload
-        // 若直接將 messages 包裝，許多播放器支援未壓縮或基本結構
-        // 由於我們不知道原本是不是已經壓過了，我們先直接導出含有標頭的檔案，如果播放器能播最好
-        // 簡單包裝
-        const yrpBuf = Buffer.alloc(msgBuf.length + 16);
-        yrpBuf.writeUInt32LE(0x31707279, 0); // 'yrp1'
-        yrpBuf.writeUInt32LE(0x1362, 4); // 假裝是 0x1362 版本
-        yrpBuf.writeUInt32LE(0, 8); // flag or hash
-        yrpBuf.writeUInt32LE(msgBuf.length, 12); // uncompressed size?
-        msgBuf.copy(yrpBuf, 16);
+        // 壓縮成 LZMA
+        const compressed = Buffer.from(lzma.compress(msgBuf, 1));
+        
+        // 取出前 5 bytes 的 LZMA properties
+        const props = compressed.slice(0, 5);
+        // 取出真正的壓縮 payload (lzma node 模組的壓縮資料從 offset 13 開始)
+        const payload = compressed.slice(13);
+
+        // 建立 YRP 檔案標頭 (32 bytes)
+        // id(4), version(4), flag(4), seed(4), data_size(4), hash(4), props(8)
+        const header = Buffer.alloc(32);
+        header.writeUInt32LE(0x31707279, 0); // 'yrp1'
+        header.writeUInt32LE(0x136A, 4);     // version
+        header.writeUInt32LE(0, 8);          // flag
+        header.writeUInt32LE(seed, 12);      // seed
+        header.writeUInt32LE(msgBuf.length, 16); // uncompressed data_size
+        header.writeUInt32LE(0, 20);         // hash
+        
+        // 將 5 bytes properties 寫入 props[8]
+        props.copy(header, 24);
+
+        // 組合標頭與壓縮資料
+        const yrpBuf = Buffer.concat([header, payload]);
 
         res.setHeader('Content-Type', 'application/octet-stream');
         res.setHeader('Content-Disposition', `attachment; filename="replay_${id}.yrp"`);
