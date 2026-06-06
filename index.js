@@ -537,23 +537,32 @@ app.get('/api/stats/cards/ranking', async (req, res) => {
             WHERE to_char(r."startTime", 'YYYY-MM') = $1
         `, [month]);
 
-        const cardCounts = {};
+        const cardUsage = {}; // { [id]: { totalCopies: 0, deckAppearances: 0 } }
         for (const row of result.rows) {
             const cardIds = parseDeckBuffer(row.startDeckBuffer);
+            // To track deck appearances, we need unique cards in this specific deck
+            const uniqueCardsInDeck = new Set(cardIds);
+            
             for (const id of cardIds) {
-                cardCounts[id] = (cardCounts[id] || 0) + 1;
+                if (!cardUsage[id]) cardUsage[id] = { totalCopies: 0, deckAppearances: 0 };
+                cardUsage[id].totalCopies++;
+            }
+            
+            for (const id of uniqueCardsInDeck) {
+                cardUsage[id].deckAppearances++;
             }
         }
 
-        const ranking = Object.entries(cardCounts)
-            .sort((a, b) => b[1] - a[1])
+        const ranking = Object.entries(cardUsage)
+            .sort((a, b) => b[1].deckAppearances - a[1].deckAppearances) // Sort by deck appearances as primary popularity metric
             .slice(0, 50)
-            .map(([id, count]) => {
+            .map(([id, usage]) => {
                 const numId = parseInt(id);
                 return {
                     id: numId,
-                    name: cardMap.get(numId)?.name || "Unknown",
-                    count
+                    name: cardMap.get(numId)?.name || externalCardCache.get(numId)?.name || "Unknown",
+                    usageCount: usage.totalCopies,
+                    deckCount: usage.deckAppearances
                 };
             });
 
