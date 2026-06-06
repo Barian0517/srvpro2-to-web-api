@@ -21,7 +21,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const CONFIG_YAML_PATH = process.env.CONFIG_YAML_PATH;
 const DIY_CARD_DIR = process.env.DIY_CARD_DIR;
-const DATABASE_URL = process.env.DATABASE_URL;
+const DATABASE_URL = process.env.DB_URI || process.env.DATABASE_URL;
 
 let validCardDirs = [];
 
