@@ -680,22 +680,60 @@ app.get('/api/stats/replays/:id/deck/:player', async (req, res) => {
 app.get('/api/stats/replays/:id/download', async (req, res) => {
     try {
         const id = parseInt(req.params.id);
-        const result = await pgPool.query(`
+        
+        // Fetch duel record messages and seed
+        const recordRes = await pgPool.query(`
             SELECT r.messages, r.seed
             FROM duel_record r
             WHERE r.id = $1
         `, [id]);
 
-        if (result.rows.length === 0 || !result.rows[0].messages) {
+        if (recordRes.rows.length === 0 || !recordRes.rows[0].messages) {
             return res.status(404).json({ error: "Replay not found" });
         }
 
-        const messagesBase64 = result.rows[0].messages;
-        const seed = result.rows[0].seed || 0;
+        // Fetch all players for this replay
+        const playersRes = await pgPool.query(`
+            SELECT "realName", "startDeckBuffer", pos
+            FROM duel_record_player
+            WHERE "duelRecordId" = $1
+            ORDER BY pos ASC
+        `, [id]);
+
+        const messagesBase64 = recordRes.rows[0].messages;
+        const seed = recordRes.rows[0].seed || 0;
         const msgBuf = Buffer.from(messagesBase64, 'base64');
         
+        const isTag = playersRes.rows.length > 2;
+        const flag = isTag ? 1 : 0;
+        
+        const uncompressedParts = [];
+        
+        // Write player names (40 bytes UTF-16LE each)
+        for (const player of playersRes.rows) {
+            const nameBuf = Buffer.alloc(40);
+            nameBuf.write(player.realName || `Player${player.pos + 1}`, 0, 'utf16le');
+            uncompressedParts.push(nameBuf);
+        }
+        
+        // Write player decks
+        for (const player of playersRes.rows) {
+            if (player.startDeckBuffer) {
+                uncompressedParts.push(Buffer.from(player.startDeckBuffer, 'base64'));
+            } else {
+                // Empty deck fallback: mainc=0, sidec=0
+                const emptyDeck = Buffer.alloc(8);
+                uncompressedParts.push(emptyDeck);
+            }
+        }
+        
+        // Append messages
+        uncompressedParts.push(msgBuf);
+        
+        const uncompressed = Buffer.concat(uncompressedParts);
+        
         // 壓縮成 LZMA
-        const compressed = Buffer.from(lzma.compress(msgBuf, 1));
+        const compressed = Buffer.from(lzma.compress(uncompressed, 1));
         
         // 取出前 5 bytes 的 LZMA properties
         const props = compressed.slice(0, 5);
@@ -707,9 +745,9 @@ app.get('/api/stats/replays/:id/download', async (req, res) => {
         const header = Buffer.alloc(32);
         header.writeUInt32LE(0x31707279, 0); // 'yrp1'
         header.writeUInt32LE(0x136A, 4);     // version
-        header.writeUInt32LE(0, 8);          // flag
+        header.writeUInt32LE(flag, 8);       // flag
         header.writeUInt32LE(seed, 12);      // seed
-        header.writeUInt32LE(msgBuf.length, 16); // uncompressed data_size
+        header.writeUInt32LE(uncompressed.length, 16); // uncompressed data_size
         header.writeUInt32LE(0, 20);         // hash
         
         // 將 5 bytes properties 寫入 props[8]
