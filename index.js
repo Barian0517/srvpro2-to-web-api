@@ -7,6 +7,7 @@ const path = require('path');
 const yaml = require('js-yaml');
 const { ZipArchive } = require('archiver');
 const crypto = require('crypto');
+const { Pool } = require('pg');
 
 dotenv.config();
 
@@ -17,8 +18,13 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const CONFIG_YAML_PATH = process.env.CONFIG_YAML_PATH;
 const DIY_CARD_DIR = process.env.DIY_CARD_DIR;
+const DATABASE_URL = process.env.DATABASE_URL;
 
 let validCardDirs = [];
+
+const pgPool = new Pool({
+    connectionString: DATABASE_URL
+});
 
 if (CONFIG_YAML_PATH) {
     if (!fs.existsSync(CONFIG_YAML_PATH)) {
@@ -301,6 +307,373 @@ app.get('/api/download/ypk', (req, res) => {
         } else {
             res.status(404).json({ error: "YPK bundle not found or not generated yet" });
         }
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+
+function parseDeckBuffer(base64Buffer) {
+    if (!base64Buffer) return [];
+    try {
+        const buf = Buffer.from(base64Buffer, 'base64');
+        const cardIds = [];
+        // Skip first 2 uint32 if they are metadata, but let's just collect all valid IDs
+        // Actually the first uint32 is mainc, second is extrac
+        if (buf.length < 8) return [];
+        for (let i = 8; i < buf.length; i += 4) {
+            const id = buf.readUInt32LE(i);
+            if (id > 0) cardIds.push(id);
+        }
+        return cardIds;
+    } catch (err) {
+        return [];
+    }
+}
+
+function parseDeckBufferDetailed(base64Buffer) {
+    if (!base64Buffer) return { main: [], extra: [], side: [] };
+    try {
+        const buf = Buffer.from(base64Buffer, 'base64');
+        if (buf.length < 8) return { main: [], extra: [], side: [] };
+        const mainc = buf.readUInt32LE(0);
+        const extrac = buf.readUInt32LE(4);
+        
+        const main = [];
+        const extra = [];
+        const side = [];
+        
+        let offset = 8;
+        for (let i = 0; i < mainc && offset < buf.length; i++) {
+            main.push(buf.readUInt32LE(offset));
+            offset += 4;
+        }
+        for (let i = 0; i < extrac && offset < buf.length; i++) {
+            extra.push(buf.readUInt32LE(offset));
+            offset += 4;
+        }
+        while (offset < buf.length) {
+            side.push(buf.readUInt32LE(offset));
+            offset += 4;
+        }
+        return { main, extra, side };
+    } catch (err) {
+        return { main: [], extra: [], side: [] };
+    }
+}
+
+const externalCardCache = new Map();
+
+async function resolveCardNamesForDeck(cardIds) {
+    const unknownIds = new Set();
+    
+    for (const id of cardIds) {
+        if (!cardMap.has(id) && !externalCardCache.has(id)) {
+            unknownIds.add(id);
+        }
+    }
+    
+    await Promise.all(Array.from(unknownIds).map(async (id) => {
+        try {
+            const res = await fetch(`https://ygocdb.com/api/v0/?search=${id}`);
+            const data = await res.json();
+            if (data && data.result && data.result.length > 0) {
+                const name = data.result[0].cn_name || data.result[0].md_name || "Unknown";
+                externalCardCache.set(id, name);
+            } else {
+                externalCardCache.set(id, "Unknown");
+            }
+        } catch (e) {
+            console.error(`Failed to fetch card info for ${id}:`, e);
+            externalCardCache.set(id, "Unknown");
+        }
+    }));
+    
+    return cardIds.map(id => {
+        if (cardMap.has(id)) return cardMap.get(id).name;
+        return externalCardCache.get(id) || "Unknown";
+    });
+}
+
+app.get('/api/stats/months', async (req, res) => {
+    try {
+        const result = await pgPool.query(`
+            SELECT DISTINCT to_char("startTime", 'YYYY-MM') as month
+            FROM duel_record
+            ORDER BY month DESC
+        `);
+        res.json(result.rows.map(r => r.month));
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+
+app.get('/api/stats/players', async (req, res) => {
+    try {
+        const month = req.query.month || new Date().toISOString().slice(0, 7);
+        const result = await pgPool.query(`
+            SELECT p."realName", p.name,
+                   COUNT(*) as "totalMatches",
+                   SUM(CASE WHEN p.winner THEN 1 ELSE 0 END) as "winCount"
+            FROM duel_record_player p
+            JOIN duel_record r ON p."duelRecordId" = r.id
+            WHERE to_char(r."startTime", 'YYYY-MM') = $1
+            GROUP BY p."realName", p.name
+            ORDER BY "winCount" DESC, "totalMatches" DESC
+        `, [month]);
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+
+app.get('/api/stats/players/:name/decks', async (req, res) => {
+    try {
+        const month = req.query.month || new Date().toISOString().slice(0, 7);
+        const playerName = req.params.name;
+        
+        const result = await pgPool.query(`
+            SELECT DISTINCT p."startDeckBuffer"
+            FROM duel_record_player p
+            JOIN duel_record r ON p."duelRecordId" = r.id
+            WHERE to_char(r."startTime", 'YYYY-MM') = $1 AND p."realName" = $2
+        `, [month, playerName]);
+
+        const decks = result.rows.map(row => {
+            const cardIds = parseDeckBuffer(row.startDeckBuffer);
+            const cardsInfo = cardIds.map(id => cardMap.get(id) || { id, name: "Unknown" });
+            return cardsInfo;
+        });
+
+        res.json(decks);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+
+app.get('/api/stats/players/:name/records', async (req, res) => {
+    try {
+        const month = req.query.month || new Date().toISOString().slice(0, 7);
+        const playerName = req.params.name;
+
+        const result = await pgPool.query(`
+            SELECT 
+                r.id, r."startTime", r."endTime", r.name as "roomName",
+                p."startDeckBuffer", p.winner,
+                op."realName" as "opponentName", op."startDeckBuffer" as "opponentDeckBuffer"
+            FROM duel_record_player p
+            JOIN duel_record r ON p."duelRecordId" = r.id
+            LEFT JOIN duel_record_player op ON op."duelRecordId" = r.id AND op.id != p.id
+            WHERE to_char(r."startTime", 'YYYY-MM') = $1 AND p."realName" = $2
+            ORDER BY r."startTime" DESC
+        `, [month, playerName]);
+
+        const records = result.rows.map(row => {
+            return {
+                id: row.id,
+                startTime: row.startTime,
+                endTime: row.endTime,
+                roomName: row.roomName,
+                winner: row.winner,
+                opponentName: row.opponentName,
+                playerDeck: parseDeckBuffer(row.startDeckBuffer).map(id => cardMap.get(id)?.name || "Unknown"),
+                opponentDeck: parseDeckBuffer(row.opponentDeckBuffer).map(id => cardMap.get(id)?.name || "Unknown")
+            };
+        });
+
+        res.json(records);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+
+app.get('/api/stats/cards/ranking', async (req, res) => {
+    try {
+        const month = req.query.month || new Date().toISOString().slice(0, 7);
+        const result = await pgPool.query(`
+            SELECT p."startDeckBuffer"
+            FROM duel_record_player p
+            JOIN duel_record r ON p."duelRecordId" = r.id
+            WHERE to_char(r."startTime", 'YYYY-MM') = $1
+        `, [month]);
+
+        const cardCounts = {};
+        for (const row of result.rows) {
+            const cardIds = parseDeckBuffer(row.startDeckBuffer);
+            for (const id of cardIds) {
+                cardCounts[id] = (cardCounts[id] || 0) + 1;
+            }
+        }
+
+        const ranking = Object.entries(cardCounts)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 50)
+            .map(([id, count]) => {
+                const numId = parseInt(id);
+                return {
+                    id: numId,
+                    name: cardMap.get(numId)?.name || "Unknown",
+                    count
+                };
+            });
+
+        res.json(ranking);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+
+app.get('/api/stats/replays', async (req, res) => {
+    try {
+        const month = req.query.month || new Date().toISOString().slice(0, 7);
+        const result = await pgPool.query(`
+            SELECT 
+                r.id, r."startTime", r."endTime", r.name as "roomName",
+                p1."realName" as "player1", p1."startDeckBuffer" as "deck1", p1.winner as "p1Winner",
+                p2."realName" as "player2", p2."startDeckBuffer" as "deck2", p2.winner as "p2Winner"
+            FROM duel_record r
+            LEFT JOIN duel_record_player p1 ON p1."duelRecordId" = r.id AND p1.pos = 0
+            LEFT JOIN duel_record_player p2 ON p2."duelRecordId" = r.id AND p2.pos = 1
+            WHERE to_char(r."startTime", 'YYYY-MM') = $1
+            ORDER BY r."startTime" DESC
+        `, [month]);
+
+        const replays = result.rows.map(row => ({
+            id: row.id,
+            startTime: row.startTime,
+            endTime: row.endTime,
+            roomName: row.roomName,
+            player1: row.player1,
+            player2: row.player2,
+            p1Winner: row.p1Winner,
+            p2Winner: row.p2Winner,
+            deck1Length: parseDeckBuffer(row.deck1).length,
+            deck2Length: parseDeckBuffer(row.deck2).length
+        }));
+
+        res.json(replays);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+
+app.get('/api/stats/replays/:id', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        const result = await pgPool.query(`
+            SELECT 
+                r.id, r."startTime", r."endTime", r.name as "roomName",
+                p1."realName" as "player1", p1."startDeckBuffer" as "deck1", p1.winner as "p1Winner",
+                p2."realName" as "player2", p2."startDeckBuffer" as "deck2", p2.winner as "p2Winner"
+            FROM duel_record r
+            LEFT JOIN duel_record_player p1 ON p1."duelRecordId" = r.id AND p1.pos = 0
+            LEFT JOIN duel_record_player p2 ON p2."duelRecordId" = r.id AND p2.pos = 1
+            WHERE r.id = $1
+        `, [id]);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: "Replay not found" });
+        }
+
+        const row = result.rows[0];
+        
+        const deck1Names = await resolveCardNamesForDeck(parseDeckBuffer(row.deck1));
+        const deck2Names = await resolveCardNamesForDeck(parseDeckBuffer(row.deck2));
+
+        res.json({
+            id: row.id,
+            startTime: row.startTime,
+            endTime: row.endTime,
+            roomName: row.roomName,
+            player1: row.player1,
+            player2: row.player2,
+            p1Winner: row.p1Winner,
+            p2Winner: row.p2Winner,
+            deck1: deck1Names,
+            deck2: deck2Names
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+
+app.get('/api/stats/replays/:id/deck/:player', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        const player = parseInt(req.params.player); // 1 or 2
+        const pos = player === 1 ? 0 : 1;
+
+        const result = await pgPool.query(`
+            SELECT p."startDeckBuffer", p."realName"
+            FROM duel_record_player p
+            WHERE p."duelRecordId" = $1 AND p.pos = $2
+        `, [id, pos]);
+
+        if (result.rows.length === 0 || !result.rows[0].startDeckBuffer) {
+            return res.status(404).json({ error: "Deck not found" });
+        }
+
+        const deck = parseDeckBufferDetailed(result.rows[0].startDeckBuffer);
+        const playerName = result.rows[0].realName || `player${player}`;
+
+        let ydkContent = "#created by apiserver\n";
+        ydkContent += "#main\n";
+        deck.main.forEach(id => ydkContent += `${id}\n`);
+        ydkContent += "#extra\n";
+        deck.extra.forEach(id => ydkContent += `${id}\n`);
+        ydkContent += "!side\n";
+        deck.side.forEach(id => ydkContent += `${id}\n`);
+
+        res.setHeader('Content-Type', 'text/plain');
+        res.setHeader('Content-Disposition', `attachment; filename="${playerName}_deck.ydk"`);
+        res.send(ydkContent);
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+
+app.get('/api/stats/replays/:id/download', async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        const result = await pgPool.query(`
+            SELECT r.messages, r.seed
+            FROM duel_record r
+            WHERE r.id = $1
+        `, [id]);
+
+        if (result.rows.length === 0 || !result.rows[0].messages) {
+            return res.status(404).json({ error: "Replay not found" });
+        }
+
+        const messagesBase64 = result.rows[0].messages;
+        const msgBuf = Buffer.from(messagesBase64, 'base64');
+        
+        // 建立 YRP 檔案
+        // YRP 標頭: 'yrp1' = 0x31707279, Version = 0 (目前版本有可能是其他數字，不影響太多), Hash = 0, Props = 0?
+        // 實際上 YRP 的前 16 bytes 通常包含一些標記，然後是 LZMA 壓縮的 payload
+        // 若直接將 messages 包裝，許多播放器支援未壓縮或基本結構
+        // 由於我們不知道原本是不是已經壓過了，我們先直接導出含有標頭的檔案，如果播放器能播最好
+        // 簡單包裝
+        const yrpBuf = Buffer.alloc(msgBuf.length + 16);
+        yrpBuf.writeUInt32LE(0x31707279, 0); // 'yrp1'
+        yrpBuf.writeUInt32LE(0x1362, 4); // 假裝是 0x1362 版本
+        yrpBuf.writeUInt32LE(0, 8); // flag or hash
+        yrpBuf.writeUInt32LE(msgBuf.length, 12); // uncompressed size?
+        msgBuf.copy(yrpBuf, 16);
+
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Disposition', `attachment; filename="replay_${id}.yrp"`);
+        res.send(yrpBuf);
+
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: "Internal server error" });
