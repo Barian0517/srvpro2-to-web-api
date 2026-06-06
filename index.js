@@ -331,43 +331,38 @@ function parseDeckBuffer(base64Buffer) {
     }
 }
 
-function parseDeckBufferDetailed(base64Buffer) {
-    if (!base64Buffer) return { main: [], extra: [], side: [] };
-    try {
-        const buf = Buffer.from(base64Buffer, 'base64');
-        if (buf.length < 8) return { main: [], extra: [], side: [] };
-        const mainc = buf.readUInt32LE(0);
-        const extrac = buf.readUInt32LE(4);
-        
-        const main = [];
-        const extra = [];
-        const side = [];
-        
-        let offset = 8;
-        for (let i = 0; i < mainc && offset < buf.length; i++) {
-            main.push(buf.readUInt32LE(offset));
-            offset += 4;
-        }
-        for (let i = 0; i < extrac && offset < buf.length; i++) {
-            extra.push(buf.readUInt32LE(offset));
-            offset += 4;
-        }
-        while (offset < buf.length) {
-            side.push(buf.readUInt32LE(offset));
-            offset += 4;
-        }
-        return { main, extra, side };
-    } catch (err) {
-        return { main: [], extra: [], side: [] };
-    }
-}
-
 const externalCardCache = new Map();
 
-async function resolveCardNamesForDeck(cardIds) {
-    const unknownIds = new Set();
+async function resolveDetailedDeck(base64Buffer) {
+    if (!base64Buffer) return { main: [], extra: [], side: [] };
     
-    for (const id of cardIds) {
+    let buf;
+    try {
+        buf = Buffer.from(base64Buffer, 'base64');
+    } catch (e) {
+        return { main: [], extra: [], side: [] };
+    }
+    if (buf.length < 8) return { main: [], extra: [], side: [] };
+    
+    const mainExtraCount = buf.readUInt32LE(0);
+    const sideCount = buf.readUInt32LE(4);
+    
+    const mainExtraIds = [];
+    const sideIds = [];
+    
+    let offset = 8;
+    for (let i = 0; i < mainExtraCount && offset < buf.length; i++) {
+        mainExtraIds.push(buf.readUInt32LE(offset));
+        offset += 4;
+    }
+    for (let i = 0; i < sideCount && offset < buf.length; i++) {
+        sideIds.push(buf.readUInt32LE(offset));
+        offset += 4;
+    }
+    
+    const allIds = [...mainExtraIds, ...sideIds];
+    const unknownIds = new Set();
+    for (const id of allIds) {
         if (!cardMap.has(id) && !externalCardCache.has(id)) {
             unknownIds.add(id);
         }
@@ -379,33 +374,48 @@ async function resolveCardNamesForDeck(cardIds) {
             const data = await res.json();
             if (data && data.result && data.result.length > 0) {
                 const name = data.result[0].cn_name || data.result[0].md_name || "Unknown";
-                externalCardCache.set(id, name);
+                const type = data.result[0].data ? data.result[0].data.type : 0;
+                externalCardCache.set(id, { name, type });
             } else {
-                externalCardCache.set(id, "Unknown");
+                externalCardCache.set(id, { name: "Unknown", type: 0 });
             }
         } catch (e) {
             console.error(`Failed to fetch card info for ${id}:`, e);
-            externalCardCache.set(id, "Unknown");
+            externalCardCache.set(id, { name: "Unknown", type: 0 });
         }
     }));
     
-    return cardIds.map(id => {
-        if (cardMap.has(id)) return cardMap.get(id).name;
-        return externalCardCache.get(id) || "Unknown";
-    });
-}
-
-async function resolveDetailedDeckNames(detailedDeck) {
-    const allIds = [...detailedDeck.main, ...detailedDeck.extra, ...detailedDeck.side];
-    await resolveCardNamesForDeck(allIds);
-    
-    const mapName = id => cardMap.has(id) ? cardMap.get(id).name : (externalCardCache.get(id) || "Unknown");
-    
-    return {
-        main: detailedDeck.main.map(mapName),
-        extra: detailedDeck.extra.map(mapName),
-        side: detailedDeck.side.map(mapName)
+    const getCardType = id => {
+        if (cardMap.has(id)) return cardMap.get(id).type || 0;
+        if (externalCardCache.has(id)) return externalCardCache.get(id).type || 0;
+        return 0;
     };
+    
+    const isExtraDeck = type => {
+        const TYPE_FUSION = 0x40;
+        const TYPE_SYNCHRO = 0x2000;
+        const TYPE_XYZ = 0x800000;
+        const TYPE_LINK = 0x4000000;
+        return (type & TYPE_FUSION) || (type & TYPE_SYNCHRO) || (type & TYPE_XYZ) || (type & TYPE_LINK);
+    };
+    
+    const main = [];
+    const extra = [];
+    const side = [];
+    
+    for (const id of mainExtraIds) {
+        if (isExtraDeck(getCardType(id))) {
+            extra.push(id);
+        } else {
+            main.push(id);
+        }
+    }
+    
+    for (const id of sideIds) {
+        side.push(id);
+    }
+    
+    return { main, extra, side };
 }
 
 app.get('/api/stats/months', async (req, res) => {
@@ -454,15 +464,18 @@ app.get('/api/stats/players/:name/decks', async (req, res) => {
             WHERE to_char(r."startTime", 'YYYY-MM') = $1 AND p."realName" = $2
         `, [month, playerName]);
 
-        const decks = result.rows.map(row => {
-            const detailed = parseDeckBufferDetailed(row.startDeckBuffer);
-            const mapInfo = id => cardMap.get(id) || { id, name: "Unknown" };
+        const decks = await Promise.all(result.rows.map(async row => {
+            const detailed = await resolveDetailedDeck(row.startDeckBuffer);
+            const mapInfo = id => {
+                if (cardMap.has(id)) return { id, name: cardMap.get(id).name };
+                return { id, name: externalCardCache.get(id)?.name || "Unknown" };
+            };
             return {
                 main: detailed.main.map(mapInfo),
                 extra: detailed.extra.map(mapInfo),
                 side: detailed.side.map(mapInfo)
             };
-        });
+        }));
 
         res.json(decks);
     } catch (err) {
@@ -488,10 +501,10 @@ app.get('/api/stats/players/:name/records', async (req, res) => {
             ORDER BY r."startTime" DESC
         `, [month, playerName]);
 
-        const mapName = id => cardMap.get(id)?.name || "Unknown";
-        const records = result.rows.map(row => {
-            const pDeck = parseDeckBufferDetailed(row.startDeckBuffer);
-            const oDeck = parseDeckBufferDetailed(row.opponentDeckBuffer);
+        const records = await Promise.all(result.rows.map(async row => {
+            const pDeck = await resolveDetailedDeck(row.startDeckBuffer);
+            const oDeck = await resolveDetailedDeck(row.opponentDeckBuffer);
+            const mapName = id => cardMap.get(id)?.name || externalCardCache.get(id)?.name || "Unknown";
             return {
                 id: row.id,
                 startTime: row.startTime,
@@ -502,7 +515,7 @@ app.get('/api/stats/players/:name/records', async (req, res) => {
                 playerDeck: { main: pDeck.main.map(mapName), extra: pDeck.extra.map(mapName), side: pDeck.side.map(mapName) },
                 opponentDeck: { main: oDeck.main.map(mapName), extra: oDeck.extra.map(mapName), side: oDeck.side.map(mapName) }
             };
-        });
+        }));
 
         res.json(records);
     } catch (err) {
@@ -603,11 +616,10 @@ app.get('/api/stats/replays/:id', async (req, res) => {
 
         const row = result.rows[0];
         
-        const deck1Detailed = parseDeckBufferDetailed(row.deck1);
-        const deck2Detailed = parseDeckBufferDetailed(row.deck2);
+        const deck1Detailed = await resolveDetailedDeck(row.deck1);
+        const deck2Detailed = await resolveDetailedDeck(row.deck2);
         
-        const deck1Names = await resolveDetailedDeckNames(deck1Detailed);
-        const deck2Names = await resolveDetailedDeckNames(deck2Detailed);
+        const mapName = id => cardMap.get(id)?.name || externalCardCache.get(id)?.name || "Unknown";
 
         res.json({
             id: row.id,
@@ -618,8 +630,8 @@ app.get('/api/stats/replays/:id', async (req, res) => {
             player2: row.player2,
             p1Winner: row.p1Winner,
             p2Winner: row.p2Winner,
-            deck1: deck1Names,
-            deck2: deck2Names
+            deck1: { main: deck1Detailed.main.map(mapName), extra: deck1Detailed.extra.map(mapName), side: deck1Detailed.side.map(mapName) },
+            deck2: { main: deck2Detailed.main.map(mapName), extra: deck2Detailed.extra.map(mapName), side: deck2Detailed.side.map(mapName) }
         });
     } catch (err) {
         console.error(err);
@@ -643,7 +655,7 @@ app.get('/api/stats/replays/:id/deck/:player', async (req, res) => {
             return res.status(404).json({ error: "Deck not found" });
         }
 
-        const deck = parseDeckBufferDetailed(result.rows[0].startDeckBuffer);
+        const deck = await resolveDetailedDeck(result.rows[0].startDeckBuffer);
         const playerName = result.rows[0].realName || `player${player}`;
 
         let ydkContent = "#created by apiserver\n";
