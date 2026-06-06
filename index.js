@@ -395,6 +395,19 @@ async function resolveCardNamesForDeck(cardIds) {
     });
 }
 
+async function resolveDetailedDeckNames(detailedDeck) {
+    const allIds = [...detailedDeck.main, ...detailedDeck.extra, ...detailedDeck.side];
+    await resolveCardNamesForDeck(allIds);
+    
+    const mapName = id => cardMap.has(id) ? cardMap.get(id).name : (externalCardCache.get(id) || "Unknown");
+    
+    return {
+        main: detailedDeck.main.map(mapName),
+        extra: detailedDeck.extra.map(mapName),
+        side: detailedDeck.side.map(mapName)
+    };
+}
+
 app.get('/api/stats/months', async (req, res) => {
     try {
         const result = await pgPool.query(`
@@ -442,9 +455,13 @@ app.get('/api/stats/players/:name/decks', async (req, res) => {
         `, [month, playerName]);
 
         const decks = result.rows.map(row => {
-            const cardIds = parseDeckBuffer(row.startDeckBuffer);
-            const cardsInfo = cardIds.map(id => cardMap.get(id) || { id, name: "Unknown" });
-            return cardsInfo;
+            const detailed = parseDeckBufferDetailed(row.startDeckBuffer);
+            const mapInfo = id => cardMap.get(id) || { id, name: "Unknown" };
+            return {
+                main: detailed.main.map(mapInfo),
+                extra: detailed.extra.map(mapInfo),
+                side: detailed.side.map(mapInfo)
+            };
         });
 
         res.json(decks);
@@ -471,7 +488,10 @@ app.get('/api/stats/players/:name/records', async (req, res) => {
             ORDER BY r."startTime" DESC
         `, [month, playerName]);
 
+        const mapName = id => cardMap.get(id)?.name || "Unknown";
         const records = result.rows.map(row => {
+            const pDeck = parseDeckBufferDetailed(row.startDeckBuffer);
+            const oDeck = parseDeckBufferDetailed(row.opponentDeckBuffer);
             return {
                 id: row.id,
                 startTime: row.startTime,
@@ -479,8 +499,8 @@ app.get('/api/stats/players/:name/records', async (req, res) => {
                 roomName: row.roomName,
                 winner: row.winner,
                 opponentName: row.opponentName,
-                playerDeck: parseDeckBuffer(row.startDeckBuffer).map(id => cardMap.get(id)?.name || "Unknown"),
-                opponentDeck: parseDeckBuffer(row.opponentDeckBuffer).map(id => cardMap.get(id)?.name || "Unknown")
+                playerDeck: { main: pDeck.main.map(mapName), extra: pDeck.extra.map(mapName), side: pDeck.side.map(mapName) },
+                opponentDeck: { main: oDeck.main.map(mapName), extra: oDeck.extra.map(mapName), side: oDeck.side.map(mapName) }
             };
         });
 
@@ -583,8 +603,11 @@ app.get('/api/stats/replays/:id', async (req, res) => {
 
         const row = result.rows[0];
         
-        const deck1Names = await resolveCardNamesForDeck(parseDeckBuffer(row.deck1));
-        const deck2Names = await resolveCardNamesForDeck(parseDeckBuffer(row.deck2));
+        const deck1Detailed = parseDeckBufferDetailed(row.deck1);
+        const deck2Detailed = parseDeckBufferDetailed(row.deck2);
+        
+        const deck1Names = await resolveDetailedDeckNames(deck1Detailed);
+        const deck2Names = await resolveDetailedDeckNames(deck2Detailed);
 
         res.json({
             id: row.id,
