@@ -9,6 +9,8 @@ const { ZipArchive } = require('archiver');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 const lzma = require('lzma');
+const { YGOProYrp, ReplayHeader } = require('ygopro-yrp-encode');
+const YGOProDeck = require('ygopro-deck-encode').default;
 
 dotenv.config();
 
@@ -681,17 +683,23 @@ app.get('/api/stats/replays/:id/download', async (req, res) => {
     try {
         const id = parseInt(req.params.id);
         
-        // Fetch duel record messages and seed
+        // Fetch duel record and hostInfo
         const recordRes = await pgPool.query(`
-            SELECT r.messages, r.seed
+            SELECT r.responses, r.seed, r."startTime", r."hostInfo"
             FROM duel_record r
             WHERE r.id = $1
         `, [id]);
 
-        if (recordRes.rows.length === 0 || !recordRes.rows[0].messages) {
+        if (recordRes.rows.length === 0) {
             return res.status(404).json({ error: "Replay not found" });
         }
 
+        const row = recordRes.rows[0];
+        const responsesBase64 = row.responses;
+        const seed = row.seed || 0;
+        const hostInfo = row.hostInfo || {};
+        const startTime = new Date(row.startTime);
+        
         // Fetch all players for this replay
         const playersRes = await pgPool.query(`
             SELECT "realName", "startDeckBuffer", pos
@@ -700,61 +708,69 @@ app.get('/api/stats/replays/:id/download', async (req, res) => {
             ORDER BY pos ASC
         `, [id]);
 
-        const messagesBase64 = recordRes.rows[0].messages;
-        const seed = recordRes.rows[0].seed || 0;
-        const msgBuf = Buffer.from(messagesBase64, 'base64');
-        
-        const isTag = playersRes.rows.length > 2;
-        const flag = isTag ? 1 : 0;
-        
-        const uncompressedParts = [];
-        
-        // Write player names (40 bytes UTF-16LE each)
-        for (const player of playersRes.rows) {
-            const nameBuf = Buffer.alloc(40);
-            nameBuf.write(player.realName || `Player${player.pos + 1}`, 0, 'utf16le');
-            uncompressedParts.push(nameBuf);
-        }
-        
-        // Write player decks
-        for (const player of playersRes.rows) {
-            if (player.startDeckBuffer) {
-                uncompressedParts.push(Buffer.from(player.startDeckBuffer, 'base64'));
-            } else {
-                // Empty deck fallback: mainc=0, sidec=0
-                const emptyDeck = Buffer.alloc(8);
-                uncompressedParts.push(emptyDeck);
+        const players = playersRes.rows;
+        const isTag = players.length > 2;
+
+        const OcgcoreDuelOptionFlag = {
+            PseudoShuffle: 0x40,
+            TagMode: 0x20
+        };
+
+        let opt = (hostInfo.duel_rule || 0) << 16;
+        if (hostInfo.no_shuffle_deck) opt |= OcgcoreDuelOptionFlag.PseudoShuffle;
+        if ((hostInfo.mode || 0) & 0x2) opt |= OcgcoreDuelOptionFlag.TagMode;
+
+        function parseDeckBufferToYGOProDeck(base64Buffer) {
+            if (!base64Buffer) return null;
+            const buf = Buffer.from(base64Buffer, 'base64');
+            if (buf.length < 8) return null;
+            const mainc = buf.readUInt32LE(0);
+            const sidec = buf.readUInt32LE(4);
+            const main = [];
+            const side = [];
+            let offset = 8;
+            for (let i = 0; i < mainc && offset <= buf.length - 4; i++) {
+                main.push(buf.readUInt32LE(offset));
+                offset += 4;
             }
+            for (let i = 0; i < sidec && offset <= buf.length - 4; i++) {
+                side.push(buf.readUInt32LE(offset));
+                offset += 4;
+            }
+            return new YGOProDeck({ main, extra: [], side, name: '' });
         }
-        
-        // Append messages
-        uncompressedParts.push(msgBuf);
-        
-        const uncompressed = Buffer.concat(uncompressedParts);
-        
-        // 壓縮成 LZMA
-        const compressed = Buffer.from(lzma.compress(uncompressed, 1));
-        
-        // 取出前 5 bytes 的 LZMA properties
-        const props = compressed.slice(0, 5);
-        // 取出真正的壓縮 payload (lzma node 模組的壓縮資料從 offset 13 開始)
-        const payload = compressed.slice(13);
 
-        // 建立 YRP 檔案標頭 (32 bytes)
-        // id(4), version(4), flag(4), seed(4), data_size(4), hash(4), props(8)
-        const header = Buffer.alloc(32);
-        header.writeUInt32LE(0x31707279, 0); // 'yrp1'
-        header.writeUInt32LE(0x136A, 4);     // version
-        header.writeUInt32LE(flag, 8);       // flag
-        header.writeUInt32LE(seed, 12);      // seed
-        header.writeUInt32LE(uncompressed.length, 16); // uncompressed data_size
-        header.writeUInt32LE(0, 20);         // hash
+        const header = new ReplayHeader();
+        header.id = 0x31707279; // 'yrp1' standard
+        header.version = 0x1362;
+        header.flag = 0x1 | 0x10; // COMPRESSED | UNIFORM
+        if (isTag) header.flag |= 0x2; // TAG
+        header.seedSequence = seed ? [seed] : [];
+        header.hash = Math.floor(startTime.getTime() / 1000);
         
-        // 將 5 bytes properties 寫入 props[8]
-        props.copy(header, 24);
+        const responsesBuf = responsesBase64 ? Buffer.from(responsesBase64, 'base64') : Buffer.alloc(0);
 
-        // 組合標頭與壓縮資料
-        const yrpBuf = Buffer.concat([header, payload]);
+        const yrp = new YGOProYrp({
+            header,
+            hostName: players[0]?.realName || '',
+            clientName: isTag ? players[3]?.realName || '' : players[1]?.realName || '',
+            startLp: hostInfo.start_lp || 8000,
+            startHand: hostInfo.start_hand || 5,
+            drawCount: hostInfo.draw_count || 1,
+            opt: opt,
+            hostDeck: parseDeckBufferToYGOProDeck(players[0]?.startDeckBuffer),
+            clientDeck: isTag
+                ? parseDeckBufferToYGOProDeck(players[2]?.startDeckBuffer)
+                : parseDeckBufferToYGOProDeck(players[1]?.startDeckBuffer),
+            tagHostName: isTag ? players[1]?.realName || '' : null,
+            tagClientName: isTag ? players[2]?.realName || '' : null,
+            tagHostDeck: isTag ? parseDeckBufferToYGOProDeck(players[1]?.startDeckBuffer) : null,
+            tagClientDeck: isTag ? parseDeckBufferToYGOProDeck(players[3]?.startDeckBuffer) : null,
+            singleScript: null,
+            responses: [new Uint8Array(responsesBuf)],
+        });
+
+        const yrpBuf = yrp.toYrp();
 
         res.setHeader('Content-Type', 'application/octet-stream');
         res.setHeader('Content-Disposition', `attachment; filename="replay_${id}.yrp"`);
