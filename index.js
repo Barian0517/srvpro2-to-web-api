@@ -679,6 +679,7 @@ app.get('/api/stats/replays/:id/deck/:player', async (req, res) => {
     }
 });
 
+/*
 app.get('/api/stats/replays/:id/download', async (req, res) => {
     try {
         const id = parseInt(req.params.id);
@@ -781,6 +782,7 @@ app.get('/api/stats/replays/:id/download', async (req, res) => {
         res.status(500).json({ error: "Internal server error" });
     }
 });
+*/
 
 app.listen(PORT, () => {
     console.log(`YGO DIY API Server is running on http://localhost:${PORT}`);
