@@ -554,7 +554,7 @@ app.get('/api/stats/cards/ranking', async (req, res) => {
         }
 
         const ranking = Object.entries(cardUsage)
-            .sort((a, b) => b[1].deckAppearances - a[1].deckAppearances) // Sort by deck appearances as primary popularity metric
+            .sort((a, b) => b[1].totalCopies - a[1].totalCopies) // Sort by total copies as primary popularity metric
             .slice(0, 50)
             .map(([id, usage]) => {
                 const numId = parseInt(id);
