@@ -32,6 +32,9 @@
    ```env
    PORT=3000
    
+   # 資料庫連線字串 (srvpro2 的 PostgreSQL)
+   DB_URI=postgresql://srvpro:CHANGE_ME_DB_PASS@10.0.0.10:5433/srvpro2
+
    # 指定您的 config.yaml 絕對路徑
    CONFIG_YAML_PATH=C:\Users\user\Desktop\code\YGO DIY card\app\srvpro2\config.yaml
    
