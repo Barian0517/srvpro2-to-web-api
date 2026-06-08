@@ -282,6 +282,34 @@ app.get('/api/images/:id', (req, res) => {
     res.status(404).json({ error: "Image not found" });
 });
 
+app.get('/api/cdbs', (req, res) => {
+    const cdbFiles = [];
+    for (const dir of validCardDirs) {
+        if (!fs.existsSync(dir)) continue;
+        const files = fs.readdirSync(dir);
+        const cdbs = files.filter(f => f.toLowerCase().endsWith('.cdb') && f.toLowerCase() !== 'cards.cdb');
+        for (const cdb of cdbs) {
+            if (!cdbFiles.includes(cdb)) {
+                cdbFiles.push(cdb);
+            }
+        }
+    }
+    res.json(cdbFiles);
+});
+
+app.get('/api/cdbs/:name', (req, res) => {
+    const name = req.params.name;
+    for (const dir of validCardDirs) {
+        const cdbPath = path.join(dir, name);
+        if (fs.existsSync(cdbPath)) {
+            res.setHeader('Content-Type', 'application/octet-stream');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            return res.sendFile(path.resolve(cdbPath));
+        }
+    }
+    res.status(404).json({ error: "CDB not found" });
+});
+
 app.get('/api/scripts/:id', (req, res) => {
     const id = parseInt(req.params.id);
     
