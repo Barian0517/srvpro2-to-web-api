@@ -11,6 +11,7 @@ const { Pool } = require('pg');
 const lzma = require('lzma');
 const { YGOProYrp, ReplayHeader } = require('ygopro-yrp-encode');
 const YGOProDeck = require('ygopro-deck-encode').default;
+const axios = require('axios');
 
 dotenv.config();
 
@@ -688,110 +689,54 @@ app.get('/api/stats/replays/:id/deck/:player', async (req, res) => {
     }
 });
 
-/*
 app.get('/api/stats/replays/:id/download', async (req, res) => {
     try {
         const id = parseInt(req.params.id);
-        
-        // Fetch duel record and hostInfo
-        const recordRes = await pgPool.query(`
-            SELECT r.responses, r.seed, r."startTime", r."hostInfo"
-            FROM duel_record r
-            WHERE r.id = $1
-        `, [id]);
-
-        if (recordRes.rows.length === 0) {
-            return res.status(404).json({ error: "Replay not found" });
+        if (isNaN(id)) {
+            return res.status(400).json({ error: "Invalid replay ID" });
         }
 
-        const row = recordRes.rows[0];
-        const responsesBase64 = row.responses;
-        const seed = row.seed || 0;
-        const hostInfo = row.hostInfo || {};
-        const startTime = new Date(row.startTime);
-        
-        // Fetch all players for this replay
-        const playersRes = await pgPool.query(`
-            SELECT "realName", "startDeckBuffer", pos
-            FROM duel_record_player
-            WHERE "duelRecordId" = $1
-            ORDER BY pos ASC
-        `, [id]);
+        const srvproApiUrl = process.env.SRVPRO_API_URL;
+        const srvproApiUser = process.env.SRVPRO_API_USER;
+        const srvproApiPass = process.env.SRVPRO_API_PASS;
 
-        const players = playersRes.rows;
-        const isTag = players.length > 2;
-
-        const OcgcoreDuelOptionFlag = {
-            PseudoShuffle: 0x40,
-            TagMode: 0x20
-        };
-
-        let opt = (hostInfo.duel_rule || 0) << 16;
-        if (hostInfo.no_shuffle_deck) opt |= OcgcoreDuelOptionFlag.PseudoShuffle;
-        if ((hostInfo.mode || 0) & 0x2) opt |= OcgcoreDuelOptionFlag.TagMode;
-
-        function parseDeckBufferToYGOProDeck(base64Buffer) {
-            if (!base64Buffer) return null;
-            const buf = Buffer.from(base64Buffer, 'base64');
-            if (buf.length < 8) return null;
-            const mainc = buf.readUInt32LE(0);
-            const sidec = buf.readUInt32LE(4);
-            const main = [];
-            const side = [];
-            let offset = 8;
-            for (let i = 0; i < mainc && offset <= buf.length - 4; i++) {
-                main.push(buf.readUInt32LE(offset));
-                offset += 4;
-            }
-            for (let i = 0; i < sidec && offset <= buf.length - 4; i++) {
-                side.push(buf.readUInt32LE(offset));
-                offset += 4;
-            }
-            return new YGOProDeck({ main, extra: [], side, name: '' });
+        if (!srvproApiUrl) {
+            return res.status(500).json({ error: "SRVPRO_API_URL not configured" });
         }
 
-        const header = new ReplayHeader();
-        header.id = 0x31707279; // 'yrp1' standard
-        header.version = 0x1362;
-        header.flag = 0x1 | 0x10; // COMPRESSED | UNIFORM
-        if (isTag) header.flag |= 0x2; // TAG
-        header.seedSequence = seed ? [seed] : [];
-        header.hash = Math.floor(startTime.getTime() / 1000);
+        const targetUrl = `${srvproApiUrl}/api/replay/${id}.yrp`;
         
-        const responsesBuf = responsesBase64 ? Buffer.from(responsesBase64, 'base64') : Buffer.alloc(0);
+        try {
+            const response = await axios({
+                method: 'get',
+                url: targetUrl,
+                params: {
+                    username: srvproApiUser,
+                    pass: srvproApiPass
+                },
+                responseType: 'stream'
+            });
 
-        const yrp = new YGOProYrp({
-            header,
-            hostName: players[0]?.realName || '',
-            clientName: isTag ? players[3]?.realName || '' : players[1]?.realName || '',
-            startLp: hostInfo.start_lp || 8000,
-            startHand: hostInfo.start_hand || 5,
-            drawCount: hostInfo.draw_count || 1,
-            opt: opt,
-            hostDeck: parseDeckBufferToYGOProDeck(players[0]?.startDeckBuffer),
-            clientDeck: isTag
-                ? parseDeckBufferToYGOProDeck(players[2]?.startDeckBuffer)
-                : parseDeckBufferToYGOProDeck(players[1]?.startDeckBuffer),
-            tagHostName: isTag ? players[1]?.realName || '' : null,
-            tagClientName: isTag ? players[2]?.realName || '' : null,
-            tagHostDeck: isTag ? parseDeckBufferToYGOProDeck(players[1]?.startDeckBuffer) : null,
-            tagClientDeck: isTag ? parseDeckBufferToYGOProDeck(players[3]?.startDeckBuffer) : null,
-            singleScript: null,
-            responses: [new Uint8Array(responsesBuf)],
-        });
-
-        const yrpBuf = yrp.toYrp();
-
-        res.setHeader('Content-Type', 'application/octet-stream');
-        res.setHeader('Content-Disposition', `attachment; filename="replay_${id}.yrp"`);
-        res.send(yrpBuf);
+            res.setHeader('Content-Type', 'application/octet-stream');
+            res.setHeader('Content-Disposition', `attachment; filename="${id}.yrp"`);
+            
+            response.data.pipe(res);
+        } catch (axiosError) {
+            if (axiosError.response && axiosError.response.status === 404) {
+                return res.status(404).json({ error: "Replay not found on server" });
+            }
+            if (axiosError.response && axiosError.response.status === 403) {
+                console.error("Authentication failed with srvpro2 api. Please check SRVPRO_API_USER and SRVPRO_API_PASS.");
+                return res.status(500).json({ error: "Internal server error: auth failed with upstream" });
+            }
+            throw axiosError;
+        }
 
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: "Internal server error" });
     }
 });
-*/
 
 app.listen(PORT, () => {
     console.log(`YGO DIY API Server is running on http://localhost:${PORT}`);

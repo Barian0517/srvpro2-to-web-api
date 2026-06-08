@@ -35,6 +35,11 @@
    # 資料庫連線字串 (srvpro2 的 PostgreSQL)
    DB_URI=postgresql://srvpro:CHANGE_ME_DB_PASS@10.0.0.10:5433/srvpro2
 
+   # srvpro2 Legacy API 代理下載設定 (正式環境為 10.0.0.34)
+   SRVPRO_API_URL=http://10.0.0.34:7922
+   SRVPRO_API_USER=root
+   SRVPRO_API_PASS=123456
+
    # 指定您的 config.yaml 絕對路徑
    CONFIG_YAML_PATH=C:\Users\user\Desktop\code\YGO DIY card\app\srvpro2\config.yaml
    
@@ -122,9 +127,9 @@
 - **端點**: `GET /api/stats/replays/:id`
 - **功能**：取得特定單局決鬥的雙方詳細使用牌組（卡片名稱陣列）及勝負結果。
 
-### 8. 下載重播檔案 (.yrp) (目前暫時關閉)
+### 8. 下載重播檔案 (.yrp)
 - **端點**: `GET /api/stats/replays/:id/download`
-- **功能**：將資料庫中的紀錄包裝為標準的 `.yrp` 遊戲王重播檔案。*(由於重播播放器相容性調整中，此 API 程式碼目前暫時註解關閉)*
+- **功能**：下載對局的 `.yrp` 重播檔案。伺服器會在背後向 `srvpro2` 請求最原始、無損的重播檔案後回傳給使用者。
 
 ### 9. 下載重播玩家牌組 (.ydk)
 - **端點**: `GET /api/stats/replays/:id/deck/:player`
