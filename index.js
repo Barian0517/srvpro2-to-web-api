@@ -41,7 +41,10 @@ if (CONFIG_YAML_PATH) {
     
     if (config.ygoproPath && Array.isArray(config.ygoproPath)) {
         validCardDirs = config.ygoproPath
-            .filter(p => p !== './ygopro')
+            .filter(p => {
+                const normalized = p.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/$/, '');
+                return normalized !== 'ygopro' && normalized !== 'ygopro/super-pre';
+            })
             .map(p => path.resolve(baseDir, p)); // 強制轉換為絕對路徑，解決 Linux TypeError
     }
 } else if (DIY_CARD_DIR) {
